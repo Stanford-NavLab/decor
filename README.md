@@ -4,6 +4,14 @@ Spreading code design: optimizing binary spreading codes, or pseudorandom noise
 efficient implementations of bit-flip descent methods that iteratively
 *decorrelate* a set of codes.
 
+Accompanies the paper:
+
+A. Yang, T. Mina, S. Boyd, and G. Gao. Large-Scale GNSS Spreading Code Optimization. 
+Proceedings of the 37th International Technical Meeting of the Satellite Division 
+of the Institute of Navigation (ION GNSS+ 2024)
+
+Paper link: https://stanford.edu/~boyd/papers/code_design.html
+
 ## Overview
 `decor` is a Python package for designing and optimizing binary spreading codes,
 also known as pseudorandom noise (PRN) codes. These codes are optimized to have
