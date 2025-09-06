@@ -91,7 +91,7 @@ class SpreadingCodes:
             res = self._correlation.copy()
             for i in range(self.num_codes):
                 idx = i * self.num_codes - i * (i + 1) // 2 + i
-                res[idx, 0] = self.code_length
+                res[idx, 0] = 1.0
             return res
 
         return self._correlation
