@@ -96,6 +96,18 @@ class SpreadingCodes:
 
         return self._correlation
 
+    def cross_correlation(self, i: int, j: int, full=True) -> np.ndarray:
+        """Return the cross-correlation between codes i and j, at all shifts,
+        both negative and positive."""
+        cross_correlation = self.correlation()[
+            i * self.num_codes - i * (i + 1) // 2 + j
+        ].copy()
+        if i == j:
+            cross_correlation[0] = 1.0
+        if full:
+            return np.hstack((np.flip(cross_correlation[1:]), cross_correlation))
+        return cross_correlation
+
     def objective(self, pnorm: bool = False) -> float:
         """Return the objective value of the codes."""
         if self._objective is None:
