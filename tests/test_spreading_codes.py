@@ -32,7 +32,9 @@ def test_correlation_values():
 
 def test_objective():
     x = SpreadingCodes(5, 31, p=3)
-    assert np.allclose(x.objective(), (np.abs(x.correlation()) ** 3).sum() ** (1 / 3))
+    assert np.allclose(
+        x.objective(pnorm=True), (np.abs(x.correlation()) ** 3).sum() ** (1 / 3)
+    )
 
 
 def test_deltas():
