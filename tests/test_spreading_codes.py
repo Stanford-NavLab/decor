@@ -1,5 +1,7 @@
 from decor.spreading_codes import SpreadingCodes, randb
 import numpy as np
+import pytest
+import torch
 
 
 def test_randb():
@@ -30,15 +32,20 @@ def test_correlation_values():
             idx += 1
 
 
-def test_gpu_correlation_parity():
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_gpu_correlation_parity(device_type):
     """GPU-backed correlation must match the CPU cache exactly."""
+
+    device = torch.device(device_type)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available on this host")
 
     x = SpreadingCodes(3, 17)
     # Force CPU correlation to populate the cache.
     cpu_corr = x.correlation(scaled=False).copy()
 
-    # Now flip to the GPU helper running on CPU to exercise the torch path.
-    x.use_gpu(device="cpu")
+    # Switch to the requested backend and recompute.
+    x.use_gpu(device=device.type)
     gpu_corr = x.correlation(scaled=False)
 
     assert np.array_equal(cpu_corr, gpu_corr)
@@ -114,13 +121,13 @@ def test_top_k_delta():
     tups = x.top_k_delta()
     assert np.allclose(
         np.sort(x.deltas().flatten()),
-        [x.deltas()[*tup] for tup in tups],
+        [x.deltas()[tup[0], tup[1]] for tup in tups],
     )
 
     tups = x.top_k_delta(k=7)
     assert np.allclose(
         np.sort(x.deltas().flatten())[:7],
-        [x.deltas()[*tup] for tup in tups],
+        [x.deltas()[tup[0], tup[1]] for tup in tups],
     )
 
 
