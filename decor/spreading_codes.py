@@ -9,6 +9,12 @@ import numpy as np
 from .gold_weil import gold_codes, weil_codes
 from .util import randb, argsort
 from .correlation import compute_correlation, update_correlation
+from .gpu_backend import (
+    codes_array_to_tensor,
+    compute_packed_correlation,
+    packed_correlation_to_numpy,
+    resolve_device,
+)
 
 from . import bit_flip
 
@@ -38,6 +44,7 @@ class SpreadingCodes:
 
         self._correlation = kwargs.get("_correlation", None)
         self._objective = kwargs.get("_objective", None)
+        self._device = kwargs.get("device", None)
         self._delta = kwargs.get("_delta", None)
         self._delta_dict = kwargs.get("_delta_dict", {})
 
@@ -80,6 +87,35 @@ class SpreadingCodes:
             _approx_delta_dict=copy_or_none(self._approx_delta_dict),
         )
 
+    def use_gpu(self, device: Optional[str] = None) -> None:
+        """Opt into GPU-backed helpers.
+
+        The choice is sticky for the lifetime of the instance.  Passing
+        ``device=None`` disables the GPU path and brings the instance back to
+        pure CPU behaviour.
+        """
+
+        if device is None:
+            self._device = None
+        else:
+            resolved = resolve_device(device)
+            if resolved.type == "cpu":
+                # We support explicit CPU selection so tests can exercise the
+                # torch code path without CUDA.
+                self._device = resolved
+            elif resolved.type == "cuda":
+                self._device = resolved
+            else:
+                raise ValueError(f"Unsupported torch device: {resolved}")
+
+        # Correlation caches depend on the backend, so we clear them when the
+        # device policy changes.
+        self._correlation = None
+        self._delta = None
+        self._delta_dict.clear()
+
+    # ------------------------------------------------------------------
+
     def _correlation_cache(self) -> np.ndarray:
         """Return the cached integer correlation sums.
 
@@ -91,10 +127,17 @@ class SpreadingCodes:
         if self._correlation is None:
             if self.num_codes is None or self.code_length is None:
                 raise ValueError("Cannot compute correlation: codes not initialized")
-            self._correlation = np.zeros(
-                (self.num_correlations, self.code_length), dtype=np.int64
-            )
-            compute_correlation(self.value, self._correlation)
+            if self._device is None:
+                self._correlation = np.zeros(
+                    (self.num_correlations, self.code_length), dtype=np.int64
+                )
+                compute_correlation(self.value, self._correlation)
+            else:
+                tensor = codes_array_to_tensor(
+                    self.value.astype(np.int8), device=self._device
+                )
+                correlations = compute_packed_correlation(tensor)
+                self._correlation = packed_correlation_to_numpy(correlations)
         return self._correlation
 
     def correlation(

@@ -30,6 +30,23 @@ def test_correlation_values():
             idx += 1
 
 
+def test_gpu_correlation_parity():
+    """GPU-backed correlation must match the CPU cache exactly."""
+
+    x = SpreadingCodes(3, 17)
+    # Force CPU correlation to populate the cache.
+    cpu_corr = x.correlation(scaled=False).copy()
+
+    # Now flip to the GPU helper running on CPU to exercise the torch path.
+    x.use_gpu(device="cpu")
+    gpu_corr = x.correlation(scaled=False)
+
+    assert np.array_equal(cpu_corr, gpu_corr)
+
+    # Reset to pure CPU for downstream tests to avoid unexpected state.
+    x.use_gpu(device=None)
+
+
 def test_objective():
     x = SpreadingCodes(5, 31, p=3)
     assert np.allclose(
