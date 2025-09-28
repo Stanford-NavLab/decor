@@ -20,9 +20,12 @@ def compute_correlation(x, dest):
     for i in prange(num_codes):
         for j in prange(i, num_codes):
             idx = i * num_codes - i * (i + 1) // 2 + j
-            dest[idx, :] = ifft(ffts[i] * ffts[j].conj()).real / code_length
+            corr = ifft(ffts[i] * ffts[j].conj()).real
+            for k in prange(code_length):
+                # Store raw sums as integers to reduce memory usage downstream.
+                dest[idx, k] = np.int64(np.rint(corr[k]))
             if i == j:
-                dest[idx, 0] = 0.0
+                dest[idx, 0] = 0
 
 
 @njit(fastmath=True, parallel=True)
@@ -36,9 +39,11 @@ def update_correlation(x, i, j, dest):
         if i <= r:
             idx = i * num_codes - i * (i + 1) // 2 + r
             for k in prange(i == r, code_length):
-                dest[idx, k] += -2 * x_ij * x[r, (j - k) % code_length] / code_length
+                delta = int(-2 * x_ij * x[r, (j - k) % code_length])
+                dest[idx, k] += delta
 
         if i >= r:
             idx = r * num_codes - r * (r + 1) // 2 + i
             for k in prange(i == r, code_length):
-                dest[idx, k] += -2 * x_ij * x[r, (k + j) % code_length] / code_length
+                delta = int(-2 * x_ij * x[r, (k + j) % code_length])
+                dest[idx, k] += delta

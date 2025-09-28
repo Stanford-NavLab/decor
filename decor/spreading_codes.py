@@ -80,21 +80,69 @@ class SpreadingCodes:
             _approx_delta_dict=copy_or_none(self._approx_delta_dict),
         )
 
-    def correlation(self, nonzero_autocorrelation_peak: bool = False) -> np.ndarray:
-        """Return the correlation matrix of the codes. The zero-shift
-        autocorrelation is by default set to zero."""
+    def _correlation_cache(self) -> np.ndarray:
+        """Return the cached integer correlation sums.
+
+        We keep correlations as raw integer sums to save memory. The cache is
+        materialised lazily so callers who never inspect correlations avoid any
+        extra work.
+        """
+
         if self._correlation is None:
-            self._correlation = np.zeros((self.num_correlations, self.code_length))
+            if self.num_codes is None or self.code_length is None:
+                raise ValueError("Cannot compute correlation: codes not initialized")
+            self._correlation = np.zeros(
+                (self.num_correlations, self.code_length), dtype=np.int64
+            )
             compute_correlation(self.value, self._correlation)
+        return self._correlation
+
+    def correlation(
+        self,
+        nonzero_autocorrelation_peak: bool = False,
+        *,
+        scaled: bool = True,
+        copy: bool = True,
+    ) -> np.ndarray:
+        """Return correlations for this code family.
+
+        Parameters
+        ----------
+        nonzero_autocorrelation_peak:
+            When True the zero-shift autocorrelation is set to 1.0 for scaled
+            output or to ``code_length`` for raw integer output.
+        scaled:
+            Normalise correlations by ``code_length``. When False the raw integer
+            cache is returned, which is useful for in-place updates.
+        copy:
+            When ``scaled`` is False, choose whether to copy the integer cache
+            before returning. Internal callers that plan to update the cache must
+            pass ``copy=False``.
+        """
+
+        corr_int = self._correlation_cache()
+
+        if not scaled:
+            raw = corr_int.copy() if copy or nonzero_autocorrelation_peak else corr_int
+            if nonzero_autocorrelation_peak:
+                if raw is corr_int:
+                    raw = corr_int.copy()
+                for i in range(self.num_codes):
+                    idx = i * self.num_codes - i * (i + 1) // 2 + i
+                    raw[idx, 0] = self.code_length
+            return raw
+
+        corr_float = corr_int.astype(np.float64)
+        corr_float /= self.code_length
 
         if nonzero_autocorrelation_peak:
-            res = self._correlation.copy()
+            res = corr_float.copy()
             for i in range(self.num_codes):
                 idx = i * self.num_codes - i * (i + 1) // 2 + i
                 res[idx, 0] = 1.0
             return res
 
-        return self._correlation
+        return corr_float
 
     def cross_correlation(self, i: int, j: int, full=True) -> np.ndarray:
         """Return the cross-correlation between codes i and j, at all shifts,
@@ -122,7 +170,11 @@ class SpreadingCodes:
 
         if (i, j) not in self._delta_dict:
             self._delta_dict[i, j] = bit_flip.delta(
-                i, j, self.value, self.correlation(), self.p
+                i,
+                j,
+                self.value,
+                self.correlation(scaled=False, copy=False),
+                self.p,
             )
 
         return self._delta_dict[i, j]
@@ -131,7 +183,12 @@ class SpreadingCodes:
         """Return the change in objective value of flipping each bit."""
         if self._delta is None:
             self._delta = np.zeros(self.shape)
-            bit_flip.deltas(self.value, self.correlation(), self.p, self._delta)
+            bit_flip.deltas(
+                self.value,
+                self.correlation(scaled=False, copy=False),
+                self.p,
+                self._delta,
+            )
 
         return self._delta
 
@@ -147,7 +204,7 @@ class SpreadingCodes:
         """Flip the sign of the given bit."""
         delta = self.delta(i, j)
 
-        update_correlation(self.value, i, j, self._correlation)
+        update_correlation(self.value, i, j, self._correlation_cache())
         self.value[i, j] *= -1
 
         if self._objective is not None:
@@ -159,7 +216,7 @@ class SpreadingCodes:
                 i,
                 j,
                 self.value,
-                self.correlation(),
+                self.correlation(scaled=False, copy=False),
                 self.p,
                 self._delta,
             )

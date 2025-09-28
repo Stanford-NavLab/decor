@@ -21,9 +21,12 @@ def delta(i, j, x, correlations, p):
     for k in prange(1, length):
         x_ik_plus = x[i, (j + k) % length]
         x_ik_minus = x[i, (j - k) % length]
-        prev = correlations_auto[k]
-        new = prev - 2 * x_ij * (x_ik_plus + x_ik_minus) / length
-        res += np.abs(new) ** p - np.abs(prev) ** p
+        prev_int = correlations_auto[k]
+        new_int = prev_int - 2 * x_ij * (x_ik_plus + x_ik_minus)
+        prev = prev_int / length
+        new = new_int / length
+        diff = np.abs(new) ** p - np.abs(prev) ** p
+        res += diff
 
     for r in prange(num_codes):
         if r != i:
@@ -36,12 +39,15 @@ def delta(i, j, x, correlations, p):
             correlations_cross = correlations[idx_corr]
 
             for k in prange(length):
-                prev = correlations_cross[k]
+                prev_int = correlations_cross[k]
                 if r < i:
-                    new = prev - 2 * x_ij * x[r, (k + j) % length] / length
+                    new_int = prev_int - 2 * x_ij * x[r, (k + j) % length]
                 else:
-                    new = prev - 2 * x_ij * x[r, (j - k) % length] / length
-                res += np.abs(new) ** p - np.abs(prev) ** p
+                    new_int = prev_int - 2 * x_ij * x[r, (j - k) % length]
+                prev = prev_int / length
+                new = new_int / length
+                diff = np.abs(new) ** p - np.abs(prev) ** p
+                res += diff
 
     return res
 
@@ -82,29 +88,35 @@ def update_deltas(a, b, x, correlations, p, dest):
 
                 for k in prange(length):
                     # Add new value
-                    pre = crosscorrelation[k]
+                    pre_int = crosscorrelation[k]
                     if a < i:
-                        post = pre - 2 * x_ij * x[a, (k + j) % length] / length
+                        post_int = pre_int - 2 * x_ij * x[a, (k + j) % length]
                     else:
-                        post = pre - 2 * x_ij * x[a, (j - k) % length] / length
-                    curr_delta += np.abs(post) ** p - np.abs(pre) ** p
+                        post_int = pre_int - 2 * x_ij * x[a, (j - k) % length]
+                    pre = pre_int / length
+                    post = post_int / length
+                    diff = np.abs(post) ** p - np.abs(pre) ** p
+                    curr_delta += diff
 
                     # Subtract old value
                     if a < i:
-                        pre -= 2 * x_ab * x[i, (b - k) % length] / length
+                        pre_int = pre_int - 2 * x_ab * x[i, (b - k) % length]
                         sign = 1 if (k + j) % length != b else -1
-                        post = pre - sign * 2 * x_ij * x[a, (k + j) % length] / length
+                        post_int = pre_int - sign * 2 * x_ij * x[a, (k + j) % length]
                     else:
-                        pre -= 2 * x_ab * x[i, (b + k) % length] / length
+                        pre_int = pre_int - 2 * x_ab * x[i, (b + k) % length]
                         sign = 1 if (j - k) % length != b else -1
-                        post = pre - sign * 2 * x_ij * x[a, (j - k) % length] / length
+                        post_int = pre_int - sign * 2 * x_ij * x[a, (j - k) % length]
 
-                    curr_delta -= np.abs(post) ** p - np.abs(pre) ** p
+                    pre = pre_int / length
+                    post = post_int / length
+                    diff = np.abs(post) ** p - np.abs(pre) ** p
+                    curr_delta -= diff
 
                 dest[i, j] = curr_delta
 
 
-@njit(fastmath=True, parallel=True)
+@njit(fastmath=True)
 def best_delta(x, correlations, p, indices):
     """Calculate the change in the objective function when the sign of each bit
     is flipped."""
@@ -112,37 +124,44 @@ def best_delta(x, correlations, p, indices):
     out = np.zeros(len(indices))
 
     # pylint: disable=consider-using-enumerate
-    for sel in prange(len(indices)):
+    for sel in range(len(indices)):
         i, j = indices[sel]
 
         res = 0.0
         # change in autocorrelation
         idx = i * num_codes - i * (i + 1) // 2 + i
-        for k in prange(1, length):
-            prev = correlations[idx, k]
-            new = (
-                prev
-                + (-2 * x[i, j] * (x[i, (j + k) % length] + x[i, (j - k) % length]))
-                / length
+        for k in range(1, length):
+            prev_int = correlations[idx, k]
+            new_int = prev_int - 2 * x[i, j] * (
+                x[i, (j + k) % length] + x[i, (j - k) % length]
             )
-            res += np.abs(new) ** p - np.abs(prev) ** p
+            prev = prev_int / length
+            new = new_int / length
+            diff = np.abs(new) ** p - np.abs(prev) ** p
+            res += diff
 
-        for r in prange(num_codes):
+        for r in range(num_codes):
             if r < i:
                 # change in right side cross-correlation
                 idx = r * num_codes - r * (r + 1) // 2 + i
-                for k in prange(length):
-                    prev = correlations[idx, k]
-                    new = prev - 2 * x[i, j] * x[r, (k + j) % length] / length
-                    res += np.abs(new) ** p - np.abs(prev) ** p
+                for k in range(length):
+                    prev_int = correlations[idx, k]
+                    new_int = prev_int - 2 * x[i, j] * x[r, (k + j) % length]
+                    prev = prev_int / length
+                    new = new_int / length
+                    diff = np.abs(new) ** p - np.abs(prev) ** p
+                    res += diff
 
             elif r > i:
                 # change in left side cross-correlation
                 idx = i * num_codes - i * (i + 1) // 2 + r
-                for k in prange(length):
-                    prev = correlations[idx, k]
-                    new = prev - 2 * x[i, j] * x[r, (j - k) % length] / length
-                    res += np.abs(new) ** p - np.abs(prev) ** p
+                for k in range(length):
+                    prev_int = correlations[idx, k]
+                    new_int = prev_int - 2 * x[i, j] * x[r, (j - k) % length]
+                    prev = prev_int / length
+                    new = new_int / length
+                    diff = np.abs(new) ** p - np.abs(prev) ** p
+                    res += diff
 
         out[sel] = res
 

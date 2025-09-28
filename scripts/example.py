@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     methods = [
         # [TopKGreedyCodeOptimizer(num_neighbors=100), 10**6],
-        [AdaptiveKGreedyCodeOptimizer(), 10**6],
+        [AdaptiveKGreedyCodeOptimizer(), 10**3],
         # [ColumnMajorCyclicCodeOptimizer(), 10**3],
         # [GreedyCodeOptimizer(), 5],
     ]

@@ -140,7 +140,7 @@ class TopKGreedyCodeOptimizer(SpreadingCodeOptimizer):
 
         i, j = best_delta(
             codes.value,
-            codes.correlation(),
+            codes.correlation(scaled=False, copy=False),
             codes.p,
             indices,
         )
