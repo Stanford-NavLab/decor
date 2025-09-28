@@ -9,8 +9,11 @@ import numpy as np
 from .gold_weil import gold_codes, weil_codes
 from .util import randb, argsort
 from .correlation import compute_correlation, update_correlation
+import torch
+
 from .gpu_backend import (
     codes_array_to_tensor,
+    compute_delta_map,
     compute_packed_correlation,
     packed_correlation_to_numpy,
     resolve_device,
@@ -212,26 +215,62 @@ class SpreadingCodes:
             return self._delta[i, j]
 
         if (i, j) not in self._delta_dict:
-            self._delta_dict[i, j] = bit_flip.delta(
-                i,
-                j,
-                self.value,
-                self.correlation(scaled=False, copy=False),
-                self.p,
-            )
+            if self._device is None:
+                self._delta_dict[i, j] = bit_flip.delta(
+                    i,
+                    j,
+                    self.value,
+                    self.correlation(scaled=False, copy=False),
+                    self.p,
+                )
+            else:
+                if self._correlation is None:
+                    self._correlation_cache()
+
+                codes_tensor = codes_array_to_tensor(
+                    self.value.astype(np.int8), device=self._device
+                )
+                corr_tensor = torch.tensor(
+                    self._correlation,
+                    device=self._device,
+                    dtype=torch.int64,
+                )
+                delta_tensor = compute_delta_map(
+                    codes_tensor, corr_tensor, float(self.p)
+                )
+                self._delta = delta_tensor.cpu().numpy()
+                self._delta_dict.clear()
+                return float(self._delta[i, j])
 
         return self._delta_dict[i, j]
 
     def deltas(self) -> None:
         """Return the change in objective value of flipping each bit."""
         if self._delta is None:
-            self._delta = np.zeros(self.shape)
-            bit_flip.deltas(
-                self.value,
-                self.correlation(scaled=False, copy=False),
-                self.p,
-                self._delta,
-            )
+            if self._device is None:
+                self._delta = np.zeros(self.shape)
+                bit_flip.deltas(
+                    self.value,
+                    self.correlation(scaled=False, copy=False),
+                    self.p,
+                    self._delta,
+                )
+            else:
+                if self._correlation is None:
+                    self._correlation_cache()
+
+                codes_tensor = codes_array_to_tensor(
+                    self.value.astype(np.int8), device=self._device
+                )
+                corr_tensor = torch.tensor(
+                    self._correlation,
+                    device=self._device,
+                    dtype=torch.int64,
+                )
+                delta_tensor = compute_delta_map(
+                    codes_tensor, corr_tensor, float(self.p)
+                )
+                self._delta = delta_tensor.cpu().numpy()
 
         return self._delta
 

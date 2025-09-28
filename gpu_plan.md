@@ -137,14 +137,17 @@ C) Optional: update_deltas_after_flip
     • Stage 0 (parity groundwork) – completed
     • Added PyTorch helper module mirroring the NumPy correlation path.
     • Kept data layout identical to the CPU cache and added golden-value tests.
-    • Stage 1 (correlation + data movement) – in progress
+    • Stage 1 (correlation + data movement) – completed
     • Implement helpers to move codebooks to/from GPU memory with explicit dtypes (codes as int8/float32, correlations as int32/64) ✅
     • Re-implement full correlation with torch.fft, populate integer caches, and verify parity with CPU for small and medium n, T pairs ✅
     • Teach SpreadingCodes to opt into the GPU correlation path via an opt-in flag or injected backend while keeping CPU as the default ✅
-    • Stage 2 (delta map evaluation)
-    • Prototype a torch-only implementation that recomputes full delta maps on device using the existing formulas to validate math and indexing.
-    • Introduce Triton kernels only after the torch prototype matches CPU results and profiling shows the expected bottlenecks.
-    • Cache the |s|^p lookup table on device and share it between kernels.
+    • Stage 2 (delta map evaluation) – in progress
+    • [x] Prototype a torch-only implementation that recomputes full delta maps on device using the existing formulas to validate math and indexing.
+    • [ ] Introduce Triton kernels only after the torch prototype matches CPU results and profiling shows the expected bottlenecks.
+    • [x] Cache the |s|^p lookup table on device and share it between kernels.
+    • [x] Add regression tests that compare GPU delta values against the NumPy baseline across representative (n, T, p) tuples.
+    • [ ] Benchmark the torch delta map path to set a target for the later Triton kernels and record baseline throughput in the plan.
+    • [ ] Document GPU delta integration steps (data transfers, dtype expectations, cache semantics) for future Triton porting.
     • Stage 3 (incremental updates and optimizer loop)
     • Implement the update_corr_one_flip and per-row delta refresh kernels.
     • Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging.

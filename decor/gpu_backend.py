@@ -7,11 +7,30 @@ basic tensor transfers and a parity-checked correlation routine that mirrors
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 from torch.fft import fft as torch_fft, ifft as torch_ifft
+
+
+# Cache lookup tables per (device, length, p, dtype).  The cache keeps small
+# tensors on device so callers can reuse them between delta computations.
+_LUT_CACHE: dict[Tuple[str, int, int, float, torch.dtype], torch.Tensor] = {}
+
+
+def _packed_index(i: int, j: int, num_codes: int) -> int:
+    """Return the packed upper-triangular index for (i, j).
+
+    The GPU helpers mirror the CPU cache layout.  We keep this helper local so
+    the formula stays in one place and we can reference it wherever we need to
+    touch packed correlation rows.
+    """
+
+    if j < i:
+        raise ValueError("Packed index helper expects i <= j")
+
+    return i * num_codes - i * (i + 1) // 2 + j
 
 
 def resolve_device(preferred: Optional[str] = None) -> torch.device:
@@ -157,3 +176,162 @@ def packed_correlation_to_numpy(correlations: torch.Tensor) -> np.ndarray:
     # ``cpu()`` followed by ``numpy()`` materialises a view.  We copy so that
     # callers can mutate the result without touching torch-managed memory.
     return correlations.to(device="cpu", dtype=torch.int64).cpu().numpy().copy()
+
+
+def build_abs_p_lut(
+    code_length: int,
+    p: float,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Precompute |s / T|**p for s in [0, T].
+
+    The delta map stores objective differences that depend on the absolute
+    value of correlation sums divided by ``code_length``.  We build the lookup
+    table on device so kernels can reuse it without round-tripping through the
+    host.  Callers can cache the result and pass it to ``compute_delta_map``.
+    """
+
+    if code_length <= 0:
+        raise ValueError("code_length must be positive")
+
+    if device is None:
+        device = resolve_device()
+
+    device_index = -1 if device.index is None else int(device.index)
+    cache_key = (device.type, device_index, int(code_length), float(p), dtype)
+
+    cached = _LUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Values run from 0 to +T because correlation sums stay within ±T.  We build
+    # the tensor directly on the requested device to avoid an extra copy.
+    indices = torch.arange(code_length + 1, device=device, dtype=dtype)
+    normalised = indices / float(code_length)
+    lut = torch.pow(normalised, p)
+    _LUT_CACHE[cache_key] = lut
+    return lut
+
+
+def compute_delta_map(
+    codes: torch.Tensor,
+    correlations: torch.Tensor,
+    p: float,
+    *,
+    lut: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute the full delta map on the selected torch device.
+
+    This prototype mirrors ``decor.bit_flip.deltas``.  It keeps the tight loops
+    in Python for clarity while relying on torch tensor ops to execute the heavy
+    arithmetic on the device.  The implementation favours parity and readable
+    logic over ultimate performance so that we can validate the math before
+    moving to Triton kernels.
+    """
+
+    if codes.dtype != torch.int8:
+        raise ValueError("codes tensor must have dtype torch.int8")
+
+    if correlations.dtype != torch.int64:
+        raise ValueError("correlations tensor must have dtype torch.int64")
+
+    if codes.dim() != 2:
+        raise ValueError("codes tensor must be two-dimensional")
+
+    if correlations.dim() != 2:
+        raise ValueError("correlations tensor must be two-dimensional")
+
+    num_codes, code_length = codes.shape
+    expected_rows = (num_codes * num_codes + num_codes) // 2
+    if correlations.shape[0] != expected_rows:
+        raise ValueError("correlations tensor has an unexpected packed shape")
+
+    if correlations.shape[1] != code_length:
+        raise ValueError("correlations tensor must use the same length as codes")
+
+    device = codes.device
+    if lut is None:
+        lut = build_abs_p_lut(code_length, p, device=device)
+
+    # The lookup table stores ``|s / T|**p`` so we only need integer indices.
+    if lut.device != device:
+        raise ValueError("lookup table must live on the same device as codes")
+
+    if lut.dtype != torch.float64:
+        # We use float64 to mirror the CPU implementation.  Keeping the check
+        # explicit prevents silent dtype drift later.
+        raise ValueError("lookup table must have dtype torch.float64")
+
+    codes_int = codes.to(torch.int64)
+    correlations_int = correlations
+
+    delta_map = torch.zeros(
+        (num_codes, code_length), dtype=torch.float64, device=device
+    )
+
+    max_index = lut.shape[0] - 1
+    # Reuse shift tensors to keep the inner loops simple and to avoid repeated
+    # allocations inside the flip loops.
+    auto_shifts = (
+        torch.arange(1, code_length, device=device, dtype=torch.int64)
+        if code_length > 1
+        else None
+    )
+    full_shifts = torch.arange(code_length, device=device, dtype=torch.int64)
+
+    for i in range(num_codes):
+        code_i = codes_int[i]
+        delta_row = delta_map[i]
+
+        auto_idx = _packed_index(i, i, num_codes)
+        auto_row = correlations_int[auto_idx]
+
+        for j in range(code_length):
+            x_ij = code_i[j]
+            two_x_ij = 2 * x_ij
+
+            delta_acc = torch.zeros((), device=device, dtype=torch.float64)
+
+            if auto_shifts is not None:
+                plus_idx = (j + auto_shifts) % code_length
+                minus_idx = (j - auto_shifts) % code_length
+                neighbours_plus = code_i[plus_idx]
+                neighbours_minus = code_i[minus_idx]
+
+                prev_vals = auto_row[auto_shifts]
+                new_vals = prev_vals - two_x_ij * (neighbours_plus + neighbours_minus)
+
+                prev_terms = lut[torch.clamp(prev_vals.abs(), max=max_index).long()]
+                new_terms = lut[torch.clamp(new_vals.abs(), max=max_index).long()]
+                delta_acc += (new_terms - prev_terms).sum()
+
+            for r in range(num_codes):
+                if r == i:
+                    continue
+
+                if r < i:
+                    corr_idx = _packed_index(r, i, num_codes)
+                else:
+                    corr_idx = _packed_index(i, r, num_codes)
+
+                corr_row = correlations_int[corr_idx]
+                prev_vals = corr_row
+
+                if r < i:
+                    indices = (j + full_shifts) % code_length
+                    neighbour_vals = codes_int[r][indices]
+                else:
+                    indices = (j - full_shifts) % code_length
+                    neighbour_vals = codes_int[r][indices]
+
+                new_vals = prev_vals - two_x_ij * neighbour_vals
+
+                prev_terms = lut[torch.clamp(prev_vals.abs(), max=max_index).long()]
+                new_terms = lut[torch.clamp(new_vals.abs(), max=max_index).long()]
+                delta_acc += (new_terms - prev_terms).sum()
+
+            delta_row[j] = delta_acc
+
+    return delta_map

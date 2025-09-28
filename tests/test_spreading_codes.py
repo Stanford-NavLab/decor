@@ -54,6 +54,33 @@ def test_gpu_correlation_parity(device_type):
     x.use_gpu(device=None)
 
 
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_gpu_delta_parity(device_type):
+    """GPU delta map must match the CPU baseline."""
+
+    device = torch.device(device_type)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available on this host")
+
+    x = SpreadingCodes(3, 19, p=3)
+
+    # CPU reference deltas.
+    cpu_deltas = x.deltas().copy()
+
+    # Switch to torch backend and recompute.
+    x.use_gpu(device=device.type)
+    gpu_deltas = x.deltas()
+
+    assert np.allclose(cpu_deltas, gpu_deltas)
+
+    # ``delta`` should return consistent single-entry values.
+    idx = (1, 7)
+    assert np.isclose(cpu_deltas[idx], x.delta(*idx))
+
+    # Reset for downstream tests.
+    x.use_gpu(device=None)
+
+
 def test_objective():
     x = SpreadingCodes(5, 31, p=3)
     assert np.allclose(
