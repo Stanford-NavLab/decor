@@ -153,6 +153,20 @@ C) Optional: update_deltas_after_flip
     • Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging.
     • Measure end-to-end behaviour, add mixed-device regression tests, and document troubleshooting steps (dtype mismatches, device sync costs).
 
+⸻
+
+13. Baseline Torch Delta Benchmark
+
+    • Command: `python scripts/benchmark_gpu_deltas.py --device cuda` (falls back to CPU when CUDA is unavailable).
+    • Configuration: warmup=2, repeats=5, seed=1234, p=2.0.
+    • Current status:
+    – Script landed, pending execution on target hardware to collect real numbers.
+    – Record measured averages, standard deviations, and throughput (M entries/s) once runs complete.
+    – Capture both CUDA and CPU figures when possible so the Triton goals have multiple reference points.
+    • Notes:
+    – The benchmark keeps all data on device; only the printed summary touches host memory.
+    – Invite future edits to append dated result tables (e.g., “2025-10-11 RTX 4090 …”) for traceability.
+
     These stages give us a reversible path: we can ship Stage 1 for immediate FFT acceleration while Stage 2/3 bake, and we preserve confidence by running CPU/GPU parity tests throughout.
 
 ⸻
