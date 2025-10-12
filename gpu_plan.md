@@ -175,16 +175,7 @@ C) Optional: update_deltas_after_flip
     – Attempted `python scripts/benchmark_gpu_deltas.py --device cuda --case 128x8192 --repeats 10`, but torch reports no CUDA support on this workstation. Re-run on a CUDA-enabled host and capture an Nsight Systems trace when available.
     – Triton kernels now exist for correlation updates and per-row deltas; benchmarking pending on GPU hardware.
     – Added a GPU parity test that flips bits via `apply_flip_inplace` to verify caches stay in sync with the CPU reference.
+    – Ran `python3 -m scripts.benchmark_gpu_deltas --device cuda` on 2025-10-12: `n=31`, `T=1023` averaged 139,803.505 ms (std 61.646 ms) → 0.00 M entries/s. Matches the earlier torch-only baseline because the benchmark still exercises `compute_delta_map` instead of the new Triton kernels.
+    – Next steps: wire the benchmark (or a sibling entry point) to call `triton_deltas_row`/`triton_update_corr_one_flip`, rerun on CUDA with Nsight Systems, and confirm the expected bandwidth-bound behaviour.
     • Expected bottleneck:
-    – The Python double loop (`i`, `j`) launches many tiny tensor operations per flip, forcing the GPU to idle while the host issues kernels and performs index gymnastics.
-    – Each inner iteration materialises gather indices (`(j ± shifts) % T`) and elementwise differences, creating thousands of strided reads instead of wide streaming loads.
-    – Until we fuse these steps into Triton kernels that stream full rows, performance will stay near the CPU baseline despite running on CUDA.
-    • Notes:
-    – The benchmark keeps all data on device; only the printed summary touches host memory.
-    – Invite future edits to append dated result tables (e.g., “2025-10-11 RTX 4090 …”) for traceability.
-
-    These stages give us a reversible path: we can ship Stage 1 for immediate FFT acceleration while Stage 2/3 bake, and we preserve confidence by running CPU/GPU parity tests throughout.
-
-⸻
-
-Conclusion: PyTorch + Triton provides the right balance of speed and development time. Storing correlations as integers and using LUTs for powers gives efficiency and exactness. With careful kernel design, substantial GPU speedups are achievable in the targeted problem regime.
+    – The Python double loop (`
