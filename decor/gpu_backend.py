@@ -13,6 +13,245 @@ import numpy as np
 import torch
 from torch.fft import fft as torch_fft, ifft as torch_ifft
 
+# Triton is optional during CPU-only development, but the GPU kernels require it.
+# We import lazily so the remainder of the module still loads when Triton is missing.
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - exercised only on non-GPU builders
+    triton = None
+    tl = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _update_corr_kernel(
+        codes_ptr,
+        correlations_ptr,
+        rows_ptr,
+        packed_ptr,
+        start_ptr,
+        direction_ptr,
+        num_rows,
+        code_length,
+        column_index,
+        x_ij,
+        codes_stride_n,
+        codes_stride_t,
+        corr_stride_row,
+        corr_stride_t,
+        BLOCK_N: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Triton program that streams packed correlation rows."""
+
+        pid_rows = tl.program_id(0)
+        pid_time = tl.program_id(1)
+
+        row_offsets = pid_rows * BLOCK_N + tl.arange(0, BLOCK_N)
+        time_offsets = pid_time * BLOCK_T + tl.arange(0, BLOCK_T)
+
+        delta_factor = tl.full((), -2, dtype=tl.int32) * x_ij
+
+        for lane in tl.static_range(BLOCK_N):
+            row_offset = row_offsets[lane]
+            lane_active = row_offset < num_rows
+            if not lane_active:
+                continue
+
+            row_index = tl.load(rows_ptr + row_offset)
+            start_offset = tl.load(start_ptr + row_offset)
+            direction = tl.load(direction_ptr + row_offset)
+            corr_index = tl.load(packed_ptr + row_offset)
+
+            k_indices = time_offsets + start_offset
+            mask_valid = k_indices < code_length
+
+            corr_ptr_lane = (
+                correlations_ptr
+                + corr_index * corr_stride_row
+                + k_indices * corr_stride_t
+            )
+            current_vals = tl.load(corr_ptr_lane, mask=mask_valid, other=0)
+
+            minus_idx = column_index - k_indices
+            minus_idx = minus_idx + code_length * (minus_idx < 0)
+            plus_idx = column_index + k_indices
+            plus_idx = plus_idx - code_length * (plus_idx >= code_length)
+
+            neighbour_idx = plus_idx + (minus_idx - plus_idx) * direction
+
+            code_ptr_lane = (
+                codes_ptr + row_index * codes_stride_n + neighbour_idx * codes_stride_t
+            )
+            neighbour_vals = tl.load(code_ptr_lane, mask=mask_valid, other=0).to(
+                tl.int32
+            )
+
+            delta_vals = delta_factor * neighbour_vals
+            updated_vals = current_vals + delta_vals.to(current_vals.dtype)
+            tl.store(corr_ptr_lane, updated_vals, mask=mask_valid)
+
+    @triton.jit
+    def _deltas_autocorr_kernel(
+        codes_ptr,
+        correlations_ptr,
+        lut_ptr,
+        delta_ptr,
+        row_index,
+        corr_index,
+        code_length,
+        max_shift,
+        codes_stride_n,
+        codes_stride_t,
+        corr_stride_row,
+        corr_stride_t,
+        shift_start,
+        BLOCK_T: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Accumulate auto-correlation delta terms for one chunk of shifts."""
+
+        pid_j = tl.program_id(0)
+
+        j_offsets = pid_j * BLOCK_T + tl.arange(0, BLOCK_T)
+        j_mask = j_offsets < code_length
+
+        code_row_ptr = codes_ptr + row_index * codes_stride_n
+        corr_row_ptr = correlations_ptr + corr_index * corr_stride_row
+
+        x_vals = tl.load(
+            code_row_ptr + j_offsets * codes_stride_t, mask=j_mask, other=0
+        ).to(tl.int32)
+        two_x_vals = 2 * x_vals
+
+        delta_tile = tl.load(delta_ptr + j_offsets, mask=j_mask, other=0.0).to(
+            tl.float64
+        )
+
+        shift_indices = shift_start + 1 + tl.arange(0, BLOCK_K)
+        mask_shift = shift_indices <= max_shift
+
+        for lane in tl.static_range(0, BLOCK_K):
+            lane_active = mask_shift[lane]
+            lane_active_f = lane_active.to(tl.float64)
+            if not lane_active:
+                continue
+
+            shift_value = shift_indices[lane]
+            prev_val = tl.load(corr_row_ptr + shift_value * corr_stride_t)
+            prev_abs = tl.abs(prev_val)
+            prev_abs = tl.where(prev_abs > code_length, code_length, prev_abs)
+            prev_idx = prev_abs.to(tl.int32)
+            prev_term = tl.load(lut_ptr + prev_idx)
+
+            plus_idx = j_offsets + shift_value
+            plus_idx = plus_idx - code_length * (plus_idx >= code_length)
+            minus_idx = j_offsets - shift_value
+            minus_idx = minus_idx + code_length * (minus_idx < 0)
+
+            plus_vals = tl.load(
+                code_row_ptr + plus_idx * codes_stride_t, mask=j_mask, other=0
+            ).to(tl.int32)
+            minus_vals = tl.load(
+                code_row_ptr + minus_idx * codes_stride_t, mask=j_mask, other=0
+            ).to(tl.int32)
+
+            neighbour_sum = plus_vals + minus_vals
+            delta_contrib = two_x_vals * neighbour_sum
+
+            new_val = prev_val - delta_contrib.to(prev_val.dtype)
+            new_abs = tl.abs(new_val)
+            new_abs = tl.where(new_abs > code_length, code_length, new_abs)
+            new_idx = new_abs.to(tl.int32)
+            new_term = tl.load(lut_ptr + new_idx)
+
+            delta_tile += lane_active_f * (new_term - prev_term)
+
+        tl.store(delta_ptr + j_offsets, delta_tile, mask=j_mask)
+
+    @triton.jit
+    def _deltas_cross_kernel(
+        codes_ptr,
+        correlations_ptr,
+        lut_ptr,
+        delta_ptr,
+        row_index,
+        other_index,
+        corr_index,
+        code_length,
+        max_shift,
+        direction_flag,
+        codes_stride_n,
+        codes_stride_t,
+        corr_stride_row,
+        corr_stride_t,
+        shift_start,
+        BLOCK_T: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Accumulate cross-correlation delta terms for one neighbour chunk."""
+
+        pid_j = tl.program_id(0)
+
+        j_offsets = pid_j * BLOCK_T + tl.arange(0, BLOCK_T)
+        j_mask = j_offsets < code_length
+
+        row_ptr = codes_ptr + row_index * codes_stride_n
+        other_ptr = codes_ptr + other_index * codes_stride_n
+        corr_ptr = correlations_ptr + corr_index * corr_stride_row
+
+        x_vals = tl.load(row_ptr + j_offsets * codes_stride_t, mask=j_mask, other=0).to(
+            tl.int32
+        )
+        two_x_vals = 2 * x_vals
+
+        delta_tile = tl.load(delta_ptr + j_offsets, mask=j_mask, other=0.0).to(
+            tl.float64
+        )
+
+        shift_indices = shift_start + tl.arange(0, BLOCK_K)
+        mask_shift = shift_indices <= max_shift
+
+        for lane in tl.static_range(0, BLOCK_K):
+            lane_active = mask_shift[lane]
+            lane_active_f = lane_active.to(tl.float64)
+            if not lane_active:
+                continue
+
+            shift_value = shift_indices[lane]
+            prev_val = tl.load(corr_ptr + shift_value * corr_stride_t)
+            prev_abs = tl.abs(prev_val)
+            prev_abs = tl.where(prev_abs > code_length, code_length, prev_abs)
+            prev_idx = prev_abs.to(tl.int32)
+            prev_term = tl.load(lut_ptr + prev_idx)
+
+            if direction_flag:
+                neighbour_idx = j_offsets - shift_value
+                neighbour_idx = neighbour_idx + code_length * (neighbour_idx < 0)
+            else:
+                neighbour_idx = j_offsets + shift_value
+                neighbour_idx = neighbour_idx - code_length * (
+                    neighbour_idx >= code_length
+                )
+
+            neighbour_vals = tl.load(
+                other_ptr + neighbour_idx * codes_stride_t, mask=j_mask, other=0
+            ).to(tl.int32)
+
+            delta_contrib = two_x_vals * neighbour_vals
+
+            new_val = prev_val - delta_contrib.to(prev_val.dtype)
+            new_abs = tl.abs(new_val)
+            new_abs = tl.where(new_abs > code_length, code_length, new_abs)
+            new_idx = new_abs.to(tl.int32)
+            new_term = tl.load(lut_ptr + new_idx)
+
+            delta_tile += lane_active_f * (new_term - prev_term)
+
+        tl.store(delta_ptr + j_offsets, delta_tile, mask=j_mask)
+
 
 # Cache lookup tables per (device, length, p, dtype).  The cache keeps small
 # tensors on device so callers can reuse them between delta computations.
@@ -406,6 +645,21 @@ def apply_flip_inplace(
     codes[i, j] = torch.neg(codes[i, j])
 
 
+def _ensure_triton_available() -> None:
+    """Raise a helpful error when Triton support is missing.
+
+    We defer the import check until the kernels are used so CPU-focused tests can
+    still exercise the torch-only fallbacks.  Callers receive a short hint that
+    explains how to enable GPU support if Triton is not present.
+    """
+
+    if triton is None or tl is None:
+        raise RuntimeError(
+            "Triton support is required for the GPU kernels. Install the 'triton'"
+            " package and ensure a CUDA-compatible device is available."
+        )
+
+
 def triton_update_corr_one_flip(
     codes: torch.Tensor,
     correlations: torch.Tensor,
@@ -415,33 +669,98 @@ def triton_update_corr_one_flip(
     block_t: int,
     block_n: int,
 ) -> None:
-    """Placeholder for the Triton correlation update kernel entry point.
+    """Update packed correlations after flipping ``codes[i, j]`` using Triton.
 
-    Parameters
-    ----------
-    codes:
-        Two-dimensional tensor of shape ``(num_codes, code_length)`` with
-        ``torch.int8`` dtype.  The tensor must live on a CUDA device.
-    correlations:
-        Packed upper-triangular correlation cache with shape
-        ``((num_codes**2 + num_codes) // 2, code_length)`` stored as
-        ``torch.int64``.  The tensor shares the device with ``codes``.
-    i, j:
-        Indices of the flip that the kernel should apply.
-    block_t:
-        Number of time elements processed per program.  Typical values fall in
-        the 1024–2048 range to saturate memory bandwidth.
-    block_n:
-        Number of code rows processed per program when streaming cross terms.
-
-    Notes
-    -----
-    The Triton implementation will update the packed correlation cache using a
-    fused kernel.  The current stub documents the expected signature so the
-    call sites can be wired up ahead of the kernel work.
+    The kernel keeps the work entirely on device and streams the affected rows in
+    wide tiles.  This mirrors :func:`update_corr_one_flip` but avoids Python loops
+    so launch overhead stays small even for large ``code_length`` values.
     """
 
-    raise NotImplementedError("Triton kernel not yet implemented")
+    _ensure_triton_available()
+
+    if codes.dtype != torch.int8:
+        raise ValueError("codes tensor must have dtype torch.int8")
+    if correlations.dtype != torch.int64:
+        raise ValueError("correlations tensor must have dtype torch.int64")
+    if codes.dim() != 2 or correlations.dim() != 2:
+        raise ValueError("codes and correlations tensors must be two-dimensional")
+
+    num_codes, code_length = codes.shape
+    if not (0 <= i < num_codes and 0 <= j < code_length):
+        raise IndexError("flip indices fall outside the code tensor")
+
+    expected_rows = (num_codes * num_codes + num_codes) // 2
+    if correlations.shape[0] != expected_rows or correlations.shape[1] != code_length:
+        raise ValueError("correlations tensor has an unexpected packed shape")
+
+    if codes.device.type != "cuda" or correlations.device != codes.device:
+        raise ValueError(
+            "Triton kernels require codes and correlations on the same CUDA device"
+        )
+
+    if block_t <= 0 or block_n <= 0:
+        raise ValueError("block_t and block_n must be positive")
+
+    if block_t % 128 != 0 or block_n % 4 != 0:
+        raise ValueError(
+            "block_t must be a multiple of 128 and block_n a multiple of 4"
+        )
+
+    codes_int = codes.to(torch.int32)
+    correlations_int = correlations
+
+    rows = torch.empty((2 * num_codes - 1,), dtype=torch.int32, device=codes.device)
+    packed = torch.empty_like(rows)
+    start = torch.empty_like(rows)
+    direction = torch.empty_like(rows)
+
+    offset = 0
+    for r in range(i, num_codes):
+        rows[offset] = r
+        packed[offset] = _packed_index(i, r, num_codes)
+        start[offset] = 1 if r == i else 0
+        direction[offset] = 1  # use (j - k) indexing
+        offset += 1
+
+    for r in range(0, i + 1):
+        rows[offset] = r
+        packed[offset] = _packed_index(r, i, num_codes)
+        start[offset] = 1 if r == i else 0
+        direction[offset] = 0  # use (k + j) indexing
+        offset += 1
+
+    num_rows = offset
+    rows = rows[:num_rows]
+    packed = packed[:num_rows]
+    start = start[:num_rows]
+    direction = direction[:num_rows]
+
+    grid = (
+        (num_rows + block_n - 1) // block_n,
+        (code_length + block_t - 1) // block_t,
+    )
+
+    x_ij = codes_int[i, j].to(torch.int32)
+
+    with torch.cuda.device(codes.device):
+        _update_corr_kernel[grid](
+            codes_int,
+            correlations_int,
+            rows,
+            packed,
+            start,
+            direction,
+            num_rows,
+            code_length,
+            j,
+            x_ij,
+            codes_int.stride(0),
+            codes_int.stride(1),
+            correlations_int.stride(0),
+            correlations_int.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_T=block_t,
+        )
 
 
 def triton_deltas_row(
@@ -453,37 +772,115 @@ def triton_deltas_row(
     block_t: int,
     block_k: int,
 ) -> torch.Tensor:
-    """Placeholder for the Triton per-row delta kernel entry point.
+    """Recompute a single delta row on device using Triton kernels."""
 
-    Parameters
-    ----------
-    codes:
-        Tensor with shape ``(num_codes, code_length)`` stored as ``torch.int8`` on
-        a CUDA device.
-    correlations:
-        Packed ``torch.int64`` correlation cache matching ``codes``.
-    lut:
-        Lookup table of length ``code_length + 1`` containing ``|s/T|**p`` values
-        in ``torch.float64``.  The tensor must share the device with ``codes``.
-    row_index:
-        Index ``i`` of the code row whose deltas we recompute.
-    block_t:
-        Number of time samples processed per program instance.
-    block_k:
-        Number of neighbour codes streamed per program when evaluating
-        cross-correlations.
+    _ensure_triton_available()
 
-    Returns
-    -------
-    torch.Tensor
-        One-dimensional tensor of length ``code_length`` with ``torch.float64``
-        dtype containing the delta values for the requested row.
+    if codes.dtype != torch.int8:
+        raise ValueError("codes tensor must have dtype torch.int8")
+    if correlations.dtype != torch.int64:
+        raise ValueError("correlations tensor must have dtype torch.int64")
+    if lut.dtype != torch.float64:
+        raise ValueError("lookup table must have dtype torch.float64")
 
-    Notes
-    -----
-    The Triton kernel will reuse the lookup table and avoid Python loops.  This
-    stub documents the contract so tests and higher-level code can depend on the
-    eventual interface without waiting for the kernel implementation.
-    """
+    if codes.dim() != 2 or correlations.dim() != 2:
+        raise ValueError("codes and correlations tensors must be two-dimensional")
 
-    raise NotImplementedError("Triton kernel not yet implemented")
+    if (
+        codes.device.type != "cuda"
+        or correlations.device != codes.device
+        or lut.device != codes.device
+    ):
+        raise ValueError(
+            "codes, correlations, and lut must share a CUDA device for Triton execution"
+        )
+
+    num_codes, code_length = codes.shape
+    if not (0 <= row_index < num_codes):
+        raise IndexError("row_index falls outside the code tensor")
+
+    expected_rows = (num_codes * num_codes + num_codes) // 2
+    if correlations.shape[0] != expected_rows or correlations.shape[1] != code_length:
+        raise ValueError("correlations tensor has an unexpected packed shape")
+
+    if lut.shape[0] != code_length + 1:
+        raise ValueError("lookup table must match code_length + 1 entries")
+
+    if block_t <= 0 or block_k <= 0:
+        raise ValueError("block_t and block_k must be positive")
+
+    if block_t % 128 != 0 or block_k % 8 != 0:
+        raise ValueError(
+            "block_t must be a multiple of 128 and block_k a multiple of 8"
+        )
+
+    codes_int = codes.to(torch.int32)
+    correlations_int = correlations
+
+    delta_row = torch.zeros(code_length, dtype=torch.float64, device=codes.device)
+
+    auto_index = _packed_index(row_index, row_index, num_codes)
+    auto_max_shift = code_length - 1
+
+    grid_t = (code_length + block_t - 1) // block_t
+    grid_k_auto = (auto_max_shift + block_k - 1) // block_k
+
+    for chunk in range(grid_k_auto):
+        shift_start = chunk * block_k
+        with torch.cuda.device(codes.device):
+            _deltas_autocorr_kernel[(grid_t,)](
+                codes_int,
+                correlations_int,
+                lut,
+                delta_row,
+                row_index,
+                auto_index,
+                code_length,
+                auto_max_shift,
+                codes_int.stride(0),
+                codes_int.stride(1),
+                correlations_int.stride(0),
+                correlations_int.stride(1),
+                shift_start,
+                BLOCK_T=block_t,
+                BLOCK_K=block_k,
+            )
+
+    for other_index in range(num_codes):
+        if other_index == row_index:
+            continue
+
+        if other_index < row_index:
+            corr_index = _packed_index(other_index, row_index, num_codes)
+            direction_flag = 0
+        else:
+            corr_index = _packed_index(row_index, other_index, num_codes)
+            direction_flag = 1
+
+        max_shift = code_length - 1
+        grid_k = (max_shift + block_k - 1) // block_k
+
+        for chunk in range(grid_k):
+            shift_start = chunk * block_k
+            with torch.cuda.device(codes.device):
+                _deltas_cross_kernel[(grid_t,)](
+                    codes_int,
+                    correlations_int,
+                    lut,
+                    delta_row,
+                    row_index,
+                    other_index,
+                    corr_index,
+                    code_length,
+                    max_shift,
+                    direction_flag,
+                    codes_int.stride(0),
+                    codes_int.stride(1),
+                    correlations_int.stride(0),
+                    correlations_int.stride(1),
+                    shift_start,
+                    BLOCK_T=block_t,
+                    BLOCK_K=block_k,
+                )
+
+    return delta_row

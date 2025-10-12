@@ -143,14 +143,16 @@ C) Optional: update_deltas_after_flip
     • Teach SpreadingCodes to opt into the GPU correlation path via an opt-in flag or injected backend while keeping CPU as the default ✅
     • Stage 2 (delta map evaluation) – in progress
     • [x] Prototype a torch-only implementation that recomputes full delta maps on device using the existing formulas to validate math and indexing.
-    • [ ] Introduce Triton kernels only after the torch prototype matches CPU results and profiling shows the expected bottlenecks.
+    • [x] Introduce Triton kernels only after the torch prototype matches CPU results and profiling shows the expected bottlenecks. (2025-10-12: `triton_update_corr_one_flip` and `triton_deltas_row` now land in `decor/gpu_backend.py` with streaming tiles.)
     • [x] Cache the |s|^p lookup table on device and share it between kernels.
     • [x] Add regression tests that compare GPU delta values against the NumPy baseline across representative (n, T, p) tuples.
     • [x] Benchmark the torch delta map path to set a target for the later Triton kernels and record baseline throughput in the plan.
     • [x] Document GPU delta integration steps (data transfers, dtype expectations, cache semantics) for future Triton porting.
     • [x] Implement torch-side `update_corr_one_flip` and `apply_flip_inplace` helpers that mirror the CPU packed-layout updates exactly and add parity tests to guard future refactors.
     • Stage 3 (incremental updates and optimizer loop)
-    • Implement the update_corr_one_flip and per-row delta refresh kernels.
+    • Implement the update_corr_one_flip and per-row delta refresh kernels. ✅ (2025-10-12 Triton versions in place; integrate with optimiser next.)
+    • Capture Nsight Systems traces for the Triton kernels on a CUDA host to quantify launch overhead and memory bandwidth utilisation.
+    • Expand regression coverage (multi-flip optimiser journeys, mixed CPU/GPU parity suites) once kernels settle.
     • [~] Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging. (2025-10-12: Greedy and TopK variants now read `delta_tensor`, so the adaptive strategy keeps flips on device when `use_gpu=True`.)
     • Measure end-to-end behaviour, add mixed-device regression tests, and document troubleshooting steps (dtype mismatches, device sync costs).
     • Promote the new torch helpers into the optimiser loop so flips stay on device without rebuilding correlation caches from NumPy.
@@ -171,6 +173,7 @@ C) Optional: update_deltas_after_flip
     – Similar runtimes across devices confirm that the torch prototype is dominated by host-driven loops rather than GPU arithmetic throughput.
     • 2025-10-12 update:
     – Attempted `python scripts/benchmark_gpu_deltas.py --device cuda --case 128x8192 --repeats 10`, but torch reports no CUDA support on this workstation. Re-run on a CUDA-enabled host and capture an Nsight Systems trace when available.
+    – Triton kernels now exist for correlation updates and per-row deltas; benchmarking pending on GPU hardware.
     – Added a GPU parity test that flips bits via `apply_flip_inplace` to verify caches stay in sync with the CPU reference.
     • Expected bottleneck:
     – The Python double loop (`i`, `j`) launches many tiny tensor operations per flip, forcing the GPU to idle while the host issues kernels and performs index gymnastics.

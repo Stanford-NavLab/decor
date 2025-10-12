@@ -4,3 +4,4 @@ rocket-fft
 scipy
 tqdm
 torch
+pytorch-triton
