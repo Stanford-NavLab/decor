@@ -12,6 +12,7 @@ import torch
 from decor import bit_flip, correlation
 from decor.gpu_backend import (
     codes_array_to_tensor,
+    apply_flip_inplace,
     compute_delta_map,
     compute_packed_correlation,
     packed_correlation_to_numpy,
@@ -74,3 +75,37 @@ def test_delta_map_parity(num_codes, code_length, p, device_type):
     bit_flip.deltas(codes, corr_np, p, dest)
 
     assert np.allclose(delta_map.cpu().numpy(), dest)
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_apply_flip_inplace_matches_cpu(device_type):
+    """In-place GPU flip updates must mirror the CPU correlation delta."""
+
+    device = torch.device(device_type)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available on this host")
+
+    rng = np.random.default_rng(seed=2468)
+    num_codes, code_length = 3, 9
+    codes = rng.choice([-1, 1], size=(num_codes, code_length)).astype(np.int8)
+
+    tensor_codes = codes_array_to_tensor(codes, device=device)
+    torch_corr = compute_packed_correlation(tensor_codes)
+
+    cpu_corr = np.zeros_like(packed_correlation_to_numpy(torch_corr))
+    codes_int = codes.astype(np.int64)
+    correlation.compute_correlation(codes_int, cpu_corr)
+
+    # Pick a deterministic index pair so the test is reproducible.
+    i, j = 1, 4
+
+    # GPU update path: operate entirely on device tensors.
+    apply_flip_inplace(tensor_codes, torch_corr, i, j)
+
+    # CPU reference: update the correlation cache then mutate the code entry.
+    correlation.update_correlation(codes_int, i, j, cpu_corr)
+    codes[i, j] *= -1
+    codes_int[i, j] *= -1
+
+    assert np.array_equal(tensor_codes.cpu().numpy(), codes)
+    assert np.array_equal(packed_correlation_to_numpy(torch_corr), cpu_corr)

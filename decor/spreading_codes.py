@@ -13,6 +13,7 @@ import torch
 
 from .gpu_backend import (
     codes_array_to_tensor,
+    apply_flip_inplace,
     compute_delta_map,
     compute_packed_correlation,
     packed_correlation_to_numpy,
@@ -286,8 +287,28 @@ class SpreadingCodes:
         """Flip the sign of the given bit."""
         delta = self.delta(i, j)
 
-        update_correlation(self.value, i, j, self._correlation_cache())
-        self.value[i, j] *= -1
+        if self._device is None:
+            update_correlation(self.value, i, j, self._correlation_cache())
+            self.value[i, j] *= -1
+        else:
+            if self._correlation is None:
+                self._correlation_cache()
+
+            # Refresh the cached torch tensors lazily so repeated flips avoid the
+            # conversion cost.  The helpers write back into the numpy caches to
+            # preserve external expectations about ``self.value`` and
+            # ``self._correlation`` mutability.
+            codes_tensor = codes_array_to_tensor(
+                self.value.astype(np.int8), device=self._device
+            )
+            corr_tensor = torch.tensor(
+                self._correlation,
+                device=self._device,
+                dtype=torch.int64,
+            )
+            apply_flip_inplace(codes_tensor, corr_tensor, i, j)
+            self.value = codes_tensor.cpu().numpy().astype(np.int8)
+            self._correlation = corr_tensor.cpu().numpy().astype(np.int64)
 
         if self._objective is not None:
             self._objective += delta

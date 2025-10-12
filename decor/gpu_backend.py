@@ -264,6 +264,8 @@ def compute_delta_map(
         # explicit prevents silent dtype drift later.
         raise ValueError("lookup table must have dtype torch.float64")
 
+    # We snapshot the integer view of the codes before mutating any entry so the
+    # correlation adjustments use the pre-flip value, just like the CPU helper.
     codes_int = codes.to(torch.int64)
     correlations_int = correlations
 
@@ -335,3 +337,70 @@ def compute_delta_map(
             delta_row[j] = delta_acc
 
     return delta_map
+
+
+def update_corr_one_flip(
+    codes: torch.Tensor,
+    correlations: torch.Tensor,
+    i: int,
+    j: int,
+) -> None:
+    """Update packed correlations after flipping ``codes[i, j]`` in-place.
+
+    We mirror ``decor.correlation.update_correlation`` but keep the arithmetic on
+    device tensors so callers avoid host round-trips.  Only integer work is
+    required, therefore we stay in ``torch.int64`` throughout to match the cache
+    layout used elsewhere in the module.
+    """
+
+    if codes.dtype != torch.int8:
+        raise ValueError("codes tensor must have dtype torch.int8")
+
+    if correlations.dtype != torch.int64:
+        raise ValueError("correlations tensor must have dtype torch.int64")
+
+    if codes.dim() != 2 or correlations.dim() != 2:
+        raise ValueError("codes and correlations tensors must be two-dimensional")
+
+    num_codes, code_length = codes.shape
+    if not (0 <= i < num_codes and 0 <= j < code_length):
+        raise IndexError("flip indices fall outside the code tensor")
+
+    expected_rows = (num_codes * num_codes + num_codes) // 2
+    if correlations.shape[0] != expected_rows or correlations.shape[1] != code_length:
+        raise ValueError("correlations tensor has an unexpected packed shape")
+
+    codes_int = codes.to(torch.int64)
+    x_ij = codes_int[i, j]
+
+    # First pass: rows where i <= r.
+    for r in range(i, num_codes):
+        idx = _packed_index(i, r, num_codes)
+        for k in range(0 if i != r else 1, code_length):
+            neighbour = codes_int[r, (j - k) % code_length]
+            correlations[idx, k] += -2 * x_ij * neighbour
+
+    # Second pass: rows where i >= r.
+    for r in range(0, i + 1):
+        idx = _packed_index(r, i, num_codes)
+        for k in range(0 if i != r else 1, code_length):
+            neighbour = codes_int[r, (k + j) % code_length]
+            correlations[idx, k] += -2 * x_ij * neighbour
+
+
+def apply_flip_inplace(
+    codes: torch.Tensor,
+    correlations: torch.Tensor,
+    i: int,
+    j: int,
+) -> None:
+    """Flip ``codes[i, j]`` and update the packed correlations on device.
+
+    Callers must ensure the tensors live on the same device and reuse the GPU
+    layout described in ``compute_packed_correlation``.  The helper first updates
+    the correlation cache using the pre-flip value and only then flips the bit to
+    keep the operations consistent with the CPU reference implementation.
+    """
+
+    update_corr_one_flip(codes, correlations, i, j)
+    codes[i, j] = torch.neg(codes[i, j])

@@ -146,12 +146,14 @@ C) Optional: update_deltas_after_flip
     • [ ] Introduce Triton kernels only after the torch prototype matches CPU results and profiling shows the expected bottlenecks.
     • [x] Cache the |s|^p lookup table on device and share it between kernels.
     • [x] Add regression tests that compare GPU delta values against the NumPy baseline across representative (n, T, p) tuples.
-    • [ ] Benchmark the torch delta map path to set a target for the later Triton kernels and record baseline throughput in the plan.
-    • [ ] Document GPU delta integration steps (data transfers, dtype expectations, cache semantics) for future Triton porting.
+    • [x] Benchmark the torch delta map path to set a target for the later Triton kernels and record baseline throughput in the plan.
+    • [x] Document GPU delta integration steps (data transfers, dtype expectations, cache semantics) for future Triton porting.
+    • [x] Implement torch-side `update_corr_one_flip` and `apply_flip_inplace` helpers that mirror the CPU packed-layout updates exactly and add parity tests to guard future refactors.
     • Stage 3 (incremental updates and optimizer loop)
     • Implement the update_corr_one_flip and per-row delta refresh kernels.
     • Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging.
     • Measure end-to-end behaviour, add mixed-device regression tests, and document troubleshooting steps (dtype mismatches, device sync costs).
+    • Promote the new torch helpers into the optimiser loop so flips stay on device without rebuilding correlation caches from NumPy.
 
 ⸻
 
@@ -160,9 +162,17 @@ C) Optional: update_deltas_after_flip
     • Command: `python scripts/benchmark_gpu_deltas.py --device cuda` (falls back to CPU when CUDA is unavailable).
     • Configuration: warmup=2, repeats=5, seed=1234, p=2.0.
     • Current status:
-    – Script landed, pending execution on target hardware to collect real numbers.
-    – Record measured averages, standard deviations, and throughput (M entries/s) once runs complete.
+    – Script landed and exercised on preliminary inputs.
+    – Record measured averages, standard deviations, and throughput (M entries/s) once runs complete on additional hardware.
     – Capture both CUDA and CPU figures when possible so the Triton goals have multiple reference points.
+    • Preliminary measurement (2025-10-11):
+    – CUDA (`n=31`, `T=1023`): avg 148,313.653 ms, std 45.137 ms → 0.00 M entries/s (rounded).
+    – CPU (`n=31`, `T=1023`): avg 144,316.146 ms, std 100.367 ms → 0.00 M entries/s (rounded).
+    – Similar runtimes across devices confirm that the torch prototype is dominated by host-driven loops rather than GPU arithmetic throughput.
+    • Expected bottleneck:
+    – The Python double loop (`i`, `j`) launches many tiny tensor operations per flip, forcing the GPU to idle while the host issues kernels and performs index gymnastics.
+    – Each inner iteration materialises gather indices (`(j ± shifts) % T`) and elementwise differences, creating thousands of strided reads instead of wide streaming loads.
+    – Until we fuse these steps into Triton kernels that stream full rows, performance will stay near the CPU baseline despite running on CUDA.
     • Notes:
     – The benchmark keeps all data on device; only the printed summary touches host memory.
     – Invite future edits to append dated result tables (e.g., “2025-10-11 RTX 4090 …”) for traceability.

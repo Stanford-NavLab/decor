@@ -61,9 +61,7 @@ def _default_cases() -> List[BenchmarkCase]:
     """Return a short list of representative benchmark sizes."""
 
     return [
-        BenchmarkCase(num_codes=64, code_length=4096),
-        BenchmarkCase(num_codes=128, code_length=8192),
-        BenchmarkCase(num_codes=256, code_length=16384),
+        BenchmarkCase(num_codes=31, code_length=1023),
     ]
 
 
@@ -295,9 +293,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
