@@ -77,6 +77,23 @@ def test_gpu_delta_parity(device_type):
     idx = (1, 7)
     assert np.isclose(cpu_deltas[idx], x.delta(*idx))
 
+    # End-to-end flip must update GPU caches without touching NumPy until
+    # callers read the public arrays.  This ensures ``apply_flip_inplace`` stays
+    # wired into the optimiser loop.
+    before_value_gpu = x.value.copy()
+
+    flip_idx = (1, 4)
+    x.flip(*flip_idx)
+
+    # Pull the NumPy views back after the flip so we can compare with a direct
+    # CPU reference that performs the same edit.
+    y = SpreadingCodes(value=before_value_gpu.copy(), p=3)
+    y.flip(*flip_idx)
+
+    assert np.allclose(x.value, y.value)
+    assert np.allclose(x.correlation(scaled=False), y.correlation(scaled=False))
+    assert np.allclose(x.deltas(), y.deltas())
+
     # Reset for downstream tests.
     x.use_gpu(device=None)
 

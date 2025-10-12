@@ -151,7 +151,7 @@ C) Optional: update_deltas_after_flip
     • [x] Implement torch-side `update_corr_one_flip` and `apply_flip_inplace` helpers that mirror the CPU packed-layout updates exactly and add parity tests to guard future refactors.
     • Stage 3 (incremental updates and optimizer loop)
     • Implement the update_corr_one_flip and per-row delta refresh kernels.
-    • Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging.
+    • [~] Extend AdaptiveKGreedyCodeOptimizer to call the GPU helpers while keeping a CPU fallback path for debugging. (2025-10-12: Greedy and TopK variants now read `delta_tensor`, so the adaptive strategy keeps flips on device when `use_gpu=True`.)
     • Measure end-to-end behaviour, add mixed-device regression tests, and document troubleshooting steps (dtype mismatches, device sync costs).
     • Promote the new torch helpers into the optimiser loop so flips stay on device without rebuilding correlation caches from NumPy.
 
@@ -169,6 +169,9 @@ C) Optional: update_deltas_after_flip
     – CUDA (`n=31`, `T=1023`): avg 148,313.653 ms, std 45.137 ms → 0.00 M entries/s (rounded).
     – CPU (`n=31`, `T=1023`): avg 144,316.146 ms, std 100.367 ms → 0.00 M entries/s (rounded).
     – Similar runtimes across devices confirm that the torch prototype is dominated by host-driven loops rather than GPU arithmetic throughput.
+    • 2025-10-12 update:
+    – Attempted `python scripts/benchmark_gpu_deltas.py --device cuda --case 128x8192 --repeats 10`, but torch reports no CUDA support on this workstation. Re-run on a CUDA-enabled host and capture an Nsight Systems trace when available.
+    – Added a GPU parity test that flips bits via `apply_flip_inplace` to verify caches stay in sync with the CPU reference.
     • Expected bottleneck:
     – The Python double loop (`i`, `j`) launches many tiny tensor operations per flip, forcing the GPU to idle while the host issues kernels and performs index gymnastics.
     – Each inner iteration materialises gather indices (`(j ± shifts) % T`) and elementwise differences, creating thousands of strided reads instead of wide streaming loads.

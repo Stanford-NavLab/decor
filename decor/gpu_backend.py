@@ -404,3 +404,86 @@ def apply_flip_inplace(
 
     update_corr_one_flip(codes, correlations, i, j)
     codes[i, j] = torch.neg(codes[i, j])
+
+
+def triton_update_corr_one_flip(
+    codes: torch.Tensor,
+    correlations: torch.Tensor,
+    i: int,
+    j: int,
+    *,
+    block_t: int,
+    block_n: int,
+) -> None:
+    """Placeholder for the Triton correlation update kernel entry point.
+
+    Parameters
+    ----------
+    codes:
+        Two-dimensional tensor of shape ``(num_codes, code_length)`` with
+        ``torch.int8`` dtype.  The tensor must live on a CUDA device.
+    correlations:
+        Packed upper-triangular correlation cache with shape
+        ``((num_codes**2 + num_codes) // 2, code_length)`` stored as
+        ``torch.int64``.  The tensor shares the device with ``codes``.
+    i, j:
+        Indices of the flip that the kernel should apply.
+    block_t:
+        Number of time elements processed per program.  Typical values fall in
+        the 1024–2048 range to saturate memory bandwidth.
+    block_n:
+        Number of code rows processed per program when streaming cross terms.
+
+    Notes
+    -----
+    The Triton implementation will update the packed correlation cache using a
+    fused kernel.  The current stub documents the expected signature so the
+    call sites can be wired up ahead of the kernel work.
+    """
+
+    raise NotImplementedError("Triton kernel not yet implemented")
+
+
+def triton_deltas_row(
+    codes: torch.Tensor,
+    correlations: torch.Tensor,
+    lut: torch.Tensor,
+    row_index: int,
+    *,
+    block_t: int,
+    block_k: int,
+) -> torch.Tensor:
+    """Placeholder for the Triton per-row delta kernel entry point.
+
+    Parameters
+    ----------
+    codes:
+        Tensor with shape ``(num_codes, code_length)`` stored as ``torch.int8`` on
+        a CUDA device.
+    correlations:
+        Packed ``torch.int64`` correlation cache matching ``codes``.
+    lut:
+        Lookup table of length ``code_length + 1`` containing ``|s/T|**p`` values
+        in ``torch.float64``.  The tensor must share the device with ``codes``.
+    row_index:
+        Index ``i`` of the code row whose deltas we recompute.
+    block_t:
+        Number of time samples processed per program instance.
+    block_k:
+        Number of neighbour codes streamed per program when evaluating
+        cross-correlations.
+
+    Returns
+    -------
+    torch.Tensor
+        One-dimensional tensor of length ``code_length`` with ``torch.float64``
+        dtype containing the delta values for the requested row.
+
+    Notes
+    -----
+    The Triton kernel will reuse the lookup table and avoid Python loops.  This
+    stub documents the contract so tests and higher-level code can depend on the
+    eventual interface without waiting for the kernel implementation.
+    """
+
+    raise NotImplementedError("Triton kernel not yet implemented")

@@ -12,6 +12,7 @@ from .correlation import compute_correlation, update_correlation
 import torch
 
 from .gpu_backend import (
+    build_abs_p_lut,
     codes_array_to_tensor,
     apply_flip_inplace,
     compute_delta_map,
@@ -54,6 +55,13 @@ class SpreadingCodes:
 
         self._approx_delta = kwargs.get("_approx_delta", None)
         self._approx_delta_dict = kwargs.get("_approx_delta_dict", {})
+
+        # GPU caches live alongside the NumPy views so we can reuse the same
+        # ``SpreadingCodes`` instance across CPU and GPU execution paths.
+        self._codes_tensor = None
+        self._correlation_tensor = None
+        self._delta_tensor = None
+        self._lut_tensor = None
 
     def __repr__(self) -> str:
         return f"SpreadingCode(n={self.num_codes}, T={self.code_length}, p={self.p})"
@@ -117,8 +125,89 @@ class SpreadingCodes:
         self._correlation = None
         self._delta = None
         self._delta_dict.clear()
+        self._codes_tensor = None
+        self._correlation_tensor = None
+        self._delta_tensor = None
+        self._lut_tensor = None
 
     # ------------------------------------------------------------------
+
+    def using_gpu(self) -> bool:
+        """Return True when the instance routes updates through torch helpers."""
+
+        return self._device is not None
+
+    # ------------------------------------------------------------------
+
+    def _ensure_gpu_state(self) -> None:
+        """Lazily materialise GPU caches when ``use_gpu`` is active.
+
+        The helper keeps the tensor view in sync with the NumPy caches so the
+        optimiser can call into GPU kernels repeatedly without rebuilding
+        temporary tensors.  Each allocation happens at most once per lifecycle
+        change (for example after a flip invalidates the delta map).
+        """
+
+        if self._device is None:
+            raise RuntimeError("GPU state requested without calling use_gpu")
+
+        device = self._device
+
+        if self._codes_tensor is None:
+            # Build the device copy directly from the canonical NumPy array.
+            self._codes_tensor = codes_array_to_tensor(
+                self.value.astype(np.int8), device=device
+            )
+
+        if self._correlation_tensor is None:
+            if self._correlation is not None:
+                # Mirror the NumPy cache onto the selected device.
+                self._correlation_tensor = torch.tensor(
+                    self._correlation,
+                    device=device,
+                    dtype=torch.int64,
+                )
+            else:
+                # Build the correlation cache entirely on device and persist it
+                # so future NumPy lookups stay coherent with the GPU view.
+                corr_tensor = compute_packed_correlation(self._codes_tensor)
+                self._correlation_tensor = corr_tensor
+                self._correlation = packed_correlation_to_numpy(corr_tensor)
+
+        if (
+            self._lut_tensor is None
+            or self._lut_tensor.shape[0] != self.code_length + 1
+            or self._lut_tensor.device != device
+        ):
+            # LUT entries depend on ``code_length`` and the selected ``p`` value.
+            self._lut_tensor = build_abs_p_lut(
+                self.code_length,
+                float(self.p),
+                device=device,
+            )
+
+    def _gpu_delta_tensor(self) -> torch.Tensor:
+        """Return the GPU delta map, computing it on demand."""
+
+        self._ensure_gpu_state()
+        if self._delta_tensor is None:
+            self._delta_tensor = compute_delta_map(
+                self._codes_tensor,
+                self._correlation_tensor,
+                float(self.p),
+                lut=self._lut_tensor,
+            )
+        return self._delta_tensor
+
+    def delta_tensor(self) -> torch.Tensor:
+        """Expose the GPU delta tensor for optimiser integration."""
+
+        if self._delta_tensor is not None:
+            return self._delta_tensor
+
+        if self._device is None:
+            raise RuntimeError("delta_tensor requires use_gpu(True)")
+        return self._gpu_delta_tensor()
 
     def _correlation_cache(self) -> np.ndarray:
         """Return the cached integer correlation sums.
@@ -137,11 +226,14 @@ class SpreadingCodes:
                 )
                 compute_correlation(self.value, self._correlation)
             else:
-                tensor = codes_array_to_tensor(
-                    self.value.astype(np.int8), device=self._device
+                self._ensure_gpu_state()
+                if self._correlation_tensor is None:
+                    self._correlation_tensor = compute_packed_correlation(
+                        self._codes_tensor
+                    )
+                self._correlation = packed_correlation_to_numpy(
+                    self._correlation_tensor
                 )
-                correlations = compute_packed_correlation(tensor)
-                self._correlation = packed_correlation_to_numpy(correlations)
         return self._correlation
 
     def correlation(
@@ -225,20 +317,8 @@ class SpreadingCodes:
                     self.p,
                 )
             else:
-                if self._correlation is None:
-                    self._correlation_cache()
-
-                codes_tensor = codes_array_to_tensor(
-                    self.value.astype(np.int8), device=self._device
-                )
-                corr_tensor = torch.tensor(
-                    self._correlation,
-                    device=self._device,
-                    dtype=torch.int64,
-                )
-                delta_tensor = compute_delta_map(
-                    codes_tensor, corr_tensor, float(self.p)
-                )
+                # Leverage the cached GPU tensor to avoid NumPy round-trips.
+                delta_tensor = self._gpu_delta_tensor()
                 self._delta = delta_tensor.cpu().numpy()
                 self._delta_dict.clear()
                 return float(self._delta[i, j])
@@ -257,20 +337,8 @@ class SpreadingCodes:
                     self._delta,
                 )
             else:
-                if self._correlation is None:
-                    self._correlation_cache()
-
-                codes_tensor = codes_array_to_tensor(
-                    self.value.astype(np.int8), device=self._device
-                )
-                corr_tensor = torch.tensor(
-                    self._correlation,
-                    device=self._device,
-                    dtype=torch.int64,
-                )
-                delta_tensor = compute_delta_map(
-                    codes_tensor, corr_tensor, float(self.p)
-                )
+                # Keep the GPU path on device to avoid expensive transfers.
+                delta_tensor = self._gpu_delta_tensor()
                 self._delta = delta_tensor.cpu().numpy()
 
         return self._delta
@@ -291,40 +359,45 @@ class SpreadingCodes:
             update_correlation(self.value, i, j, self._correlation_cache())
             self.value[i, j] *= -1
         else:
-            if self._correlation is None:
-                self._correlation_cache()
+            self._ensure_gpu_state()
+            # Mutate the cached tensors directly so callers stay on device and
+            # we avoid bouncing through NumPy between flips.  The helper updates
+            # the correlation cache before toggling the code entry to preserve
+            # parity with the CPU control flow.
+            apply_flip_inplace(self._codes_tensor, self._correlation_tensor, i, j)
 
-            # Refresh the cached torch tensors lazily so repeated flips avoid the
-            # conversion cost.  The helpers write back into the numpy caches to
-            # preserve external expectations about ``self.value`` and
-            # ``self._correlation`` mutability.
-            codes_tensor = codes_array_to_tensor(
-                self.value.astype(np.int8), device=self._device
-            )
-            corr_tensor = torch.tensor(
-                self._correlation,
-                device=self._device,
-                dtype=torch.int64,
-            )
-            apply_flip_inplace(codes_tensor, corr_tensor, i, j)
-            self.value = codes_tensor.cpu().numpy().astype(np.int8)
-            self._correlation = corr_tensor.cpu().numpy().astype(np.int64)
+            # Keep the public NumPy view in sync lazily.  We only pull the data
+            # back when downstream CPU code needs it, which happens when callers
+            # access ``self.value`` or ``self._correlation`` again.  The cheap
+            # copies here avoid sharing memory between torch and NumPy.
+            self.value = self._codes_tensor.cpu().numpy().astype(np.int8)
+            self._correlation = self._correlation_tensor.cpu().numpy().astype(np.int64)
 
         if self._objective is not None:
             self._objective += delta
 
         # update all deltas or clear cache
         if self._delta is not None:
-            bit_flip.update_deltas(
-                i,
-                j,
-                self.value,
-                self.correlation(scaled=False, copy=False),
-                self.p,
-                self._delta,
-            )
+            if self._device is None:
+                bit_flip.update_deltas(
+                    i,
+                    j,
+                    self.value,
+                    self.correlation(scaled=False, copy=False),
+                    self.p,
+                    self._delta,
+                )
+            else:
+                # Drop the stale CPU copy so the next call recomputes via GPU.
+                self._delta = None
         else:
             self._delta_dict.clear()
+
+        if self._device is not None:
+            # Clear incremental caches because the GPU helpers will rebuild
+            # them on demand using ``compute_delta_map``.
+            self._delta_dict.clear()
+            self._delta_tensor = None
 
 
 def random_code_family(

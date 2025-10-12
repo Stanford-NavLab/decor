@@ -106,6 +106,21 @@ class GreedyCodeOptimizer(SpreadingCodeOptimizer):
 
     def step(self, codes: SpreadingCodes) -> List[Tuple[int, int]]:
         """Greedy bit flip descent step."""
+        if getattr(codes, "using_gpu", None) is not None and codes.using_gpu():
+            import torch
+
+            tensor = codes.delta_tensor()
+            flat_vals = tensor.view(-1)
+            flat_idx = torch.argmin(flat_vals)
+            best_value = float(flat_vals[flat_idx].item())
+            if best_value < 0.0:
+                code_length = codes.code_length
+                i = int(flat_idx // code_length)
+                j = int(flat_idx % code_length)
+                codes.flip(i, j)
+                return [(i, j)]
+            return []
+
         i, j = codes.best_delta()
 
         if codes.delta(i, j) < 0:
@@ -130,6 +145,36 @@ class TopKGreedyCodeOptimizer(SpreadingCodeOptimizer):
 
     def step(self, codes: SpreadingCodes) -> List[Tuple[int, int]]:
         """Select a bit to flip."""
+        if getattr(codes, "_device", None) is not None:
+            import torch
+
+            tensor = codes.delta_tensor()
+            num_codes, code_length = codes.shape
+            flat_count = num_codes * code_length
+
+            # Draw candidate indices on device only once per step.  We keep the
+            # sampling logic in numpy for now because the GPU path still needs
+            # host-driven randomness, but we evaluate the candidate deltas using
+            # torch tensors to avoid NumPy round-trips.
+            flat_indices = np.random.choice(
+                flat_count, size=self.num_neighbors, replace=False
+            )
+            if self.cyclic:
+                flat_indices[0] = self.i * code_length + self.j
+                ColumnMajorCyclicCodeOptimizer.update_index(self, *codes.shape)
+
+            torch_indices = torch.from_numpy(flat_indices).to(tensor.device)
+            values = tensor.view(-1)[torch_indices]
+            best_pos = torch.argmin(values)
+            best_value = float(values[best_pos].item())
+            if best_value < 0.0:
+                flat_idx = int(flat_indices[int(best_pos)])
+                i = flat_idx // code_length
+                j = flat_idx % code_length
+                codes.flip(i, j)
+                return [(i, j)]
+            return []
+
         flat_indices = np.random.choice(
             codes.num_codes * codes.code_length, size=self.num_neighbors, replace=False
         )
